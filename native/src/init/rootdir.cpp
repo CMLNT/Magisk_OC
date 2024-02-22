@@ -12,10 +12,38 @@
 using namespace std;
 
 static vector<string> rc_list;
+static string magic_mount_list;
 
 #define ROOTMIR         MIRRDIR "/system_root"
 #define NEW_INITRC_DIR  "/system/etc/init/hw"
 #define INIT_RC         "init.rc"
+
+static void magic_mount(const string &sdir, const string &ddir = "")
+{
+    auto dir = xopen_dir(sdir.data());
+    if (!dir)
+        return;
+    for (dirent *entry; (entry = xreaddir(dir.get()));)
+    {
+        string src = sdir + "/" + entry->d_name;
+        string dest = ddir + "/" + entry->d_name;
+        if (access(dest.data(), F_OK) == 0)
+        {
+            if (entry->d_type == DT_DIR)
+            {
+                // Recursive
+                magic_mount(src, dest);
+            }
+            else
+            {
+                LOGD("Mount [%s] -> [%s]\n", src.data(), dest.data());
+                xmount(src.data(), dest.data(), nullptr, MS_BIND, nullptr);
+                magic_mount_list += dest;
+                magic_mount_list += '\n';
+            }
+        }
+    }
+}
 
 static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
@@ -97,6 +125,47 @@ on property:init.svc.zygote=stopped
 )EOF", tmp_path, MAGISK_PROC_CON);
 
         fclone_attr(fileno(src.get()), fileno(dest.get()));
+    }
+
+    if (faccessat(src_fd, "init.fission_host.rc", F_OK, 0) == 0)
+    {
+        {
+            LOGD("Patching fissiond\n");
+            mmap_data fissiond("/system/bin/fissiond", false);
+            for (size_t off : fissiond.patch("ro.build.system.fission_single_os", "ro.build.system.xxxxxxxxxxxxxxxxx"))
+            {
+                LOGD("Patch @ %08zX [ro.build.system.fission_single_os] -> [ro.build.system.xxxxxxxxxxxxxxxxx]\n", off);
+            }
+            mkdirs(ROOTOVL "/system/bin", 0755);
+            if (auto target_fissiond = xopen_file(ROOTOVL "/system/bin/fissiond", "we"))
+            {
+                fwrite(fissiond.buf(), 1, fissiond.sz(), target_fissiond.get());
+                clone_attr("/system/bin/fissiond", ROOTOVL "/system/bin/fissiond");
+            }
+        }
+        LOGD("hijack isolated\n");
+        auto hijack = xopen_file("/sys/devices/system/cpu/isolated", "re");
+        mkfifo(INTLROOT "/isolated", 0777);
+        xmount(INTLROOT "/isolated", "/sys/devices/system/cpu/isolated", nullptr, MS_BIND, nullptr);
+        if (!xfork())
+        {
+            auto dest = xopen_file(INTLROOT "/isolated", "we");
+            LOGD("hijacked isolated\n");
+            xumount2("/sys/devices/system/cpu/isolated", MNT_DETACH);
+            unlink(INTLROOT "/isolated");
+            string content;
+            full_read(fileno(hijack.get()), content);
+            {
+                string target = "/dev/cells/cell2"s + tmp_path;
+                xmkdirs(target.data(), 0);
+                xmount(tmp_path, target.data(), nullptr, MS_BIND | MS_REC, nullptr);
+                magic_mount(ROOTOVL, "/dev/cells/cell2");
+                auto mount = xopen_file(ROOTMNT, "w");
+                fwrite(magic_mount_list.data(), 1, magic_mount_list.length(), mount.get());
+            }
+            fprintf(dest.get(), "%s", content.data());
+            exit(0);
+        }
     }
 
     // Then patch init.zygote*.rc
@@ -182,27 +251,27 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
     }
 }
 
-static string magic_mount_list;
+// static string magic_mount_list;
 
-static void magic_mount(const string &sdir, const string &ddir = "") {
-    auto dir = xopen_dir(sdir.data());
-    if (!dir) return;
-    for (dirent *entry; (entry = xreaddir(dir.get()));) {
-        string src = sdir + "/" + entry->d_name;
-        string dest = ddir + "/" + entry->d_name;
-        if (access(dest.data(), F_OK) == 0) {
-            if (entry->d_type == DT_DIR) {
-                // Recursive
-                magic_mount(src, dest);
-            } else {
-                LOGD("Mount [%s] -> [%s]\n", src.data(), dest.data());
-                xmount(src.data(), dest.data(), nullptr, MS_BIND, nullptr);
-                magic_mount_list += dest;
-                magic_mount_list += '\n';
-            }
-        }
-    }
-}
+// static void magic_mount(const string &sdir, const string &ddir = "") {
+//     auto dir = xopen_dir(sdir.data());
+//     if (!dir) return;
+//     for (dirent *entry; (entry = xreaddir(dir.get()));) {
+//         string src = sdir + "/" + entry->d_name;
+//         string dest = ddir + "/" + entry->d_name;
+//         if (access(dest.data(), F_OK) == 0) {
+//             if (entry->d_type == DT_DIR) {
+//                 // Recursive
+//                 magic_mount(src, dest);
+//             } else {
+//                 LOGD("Mount [%s] -> [%s]\n", src.data(), dest.data());
+//                 xmount(src.data(), dest.data(), nullptr, MS_BIND, nullptr);
+//                 magic_mount_list += dest;
+//                 magic_mount_list += '\n';
+//             }
+//         }
+//     }
+// }
 
 static void extract_files(bool sbin) {
     const char *m32 = sbin ? "/sbin/magisk32.xz" : "magisk32.xz";
